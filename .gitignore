@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.cache/
+
+# Downloaded symbol files and memory dumps never belong in the repo
+*.json.xz
+*.lime
+*.raw
+*.mem
+*.vmem
+*.dmp
+*.elf
+vmlinux
+System.map
