@@ -34,6 +34,7 @@ CACHE_FILE = os.path.join(CACHE_DIR, "banners_plain.json")
 CACHE_MAX_AGE = 7 * 24 * 3600  # refresh the index weekly
 BANNER_RE = re.compile(rb"Linux version \d+\.\d+[^\x00\n]{0,400}")
 DWARF2JSON_REPO = "github.com/volatilityfoundation/dwarf2json@latest"
+BTF2JSON_REPO = "https://github.com/vobst/btf2json"
 
 
 def log(msg):
@@ -197,14 +198,76 @@ def build_isf(elf, system_map, out_path, build_tool=False):
     if proc.returncode != 0:
         sys.stderr.buffer.write(proc.stderr)
         raise SystemExit(f"[volsyms] dwarf2json failed (exit {proc.returncode})")
-    if out_path.endswith(".xz"):
-        with lzma.open(out_path, "wb") as fh:
-            fh.write(proc.stdout)
-    else:
-        with open(out_path, "wb") as fh:
-            fh.write(proc.stdout)
-    log(f"wrote {out_path} ({os.path.getsize(out_path)} bytes)")
+    _write_out(proc.stdout, out_path)
     return out_path
+
+
+def _write_out(data, out_path):
+    opener = lzma.open if out_path.endswith(".xz") else open
+    with opener(out_path, "wb") as fh:
+        fh.write(data)
+    log(f"wrote {out_path} ({os.path.getsize(out_path)} bytes)")
+
+
+# --------------------------------------------------------------------------- #
+# btf2json (BTF path: build a profile from a kernel with no DWARF, e.g. Arch)
+# --------------------------------------------------------------------------- #
+def ensure_btf2json(build=False):
+    exe = shutil.which("btf2json")
+    if exe:
+        return exe
+    cargobin = os.path.expanduser("~/.cargo/bin/btf2json")
+    if os.path.exists(cargobin):
+        return cargobin
+    if not build:
+        return None
+    if not shutil.which("cargo"):
+        raise SystemExit("[volsyms] 'cargo' not found. On Arch: sudo pacman -S rust")
+    log(f"building btf2json via: cargo install --git {BTF2JSON_REPO}")
+    subprocess.run(["cargo", "install", "--git", BTF2JSON_REPO], check=True)
+    return cargobin if os.path.exists(cargobin) else shutil.which("btf2json")
+
+
+def build_isf_btf(btf, map_file, out_path, build_tool=False):
+    if not map_file:
+        raise SystemExit(
+            "[volsyms] btf2json needs a symbol map: --system-map <System.map or /proc/kallsyms>"
+        )
+    exe = ensure_btf2json(build=build_tool)
+    if not exe:
+        raise SystemExit(
+            "[volsyms] btf2json not found. Re-run with --build-tool "
+            "(needs Rust/cargo: sudo pacman -S rust)."
+        )
+    cmd = [exe, "--btf", btf, "--map", map_file]
+    log("running: " + " ".join(cmd))
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        sys.stderr.buffer.write(proc.stderr)
+        raise SystemExit(f"[volsyms] btf2json failed (exit {proc.returncode})")
+    _write_out(proc.stdout, out_path)
+    return out_path
+
+
+def schemas_dir():
+    import volatility3
+
+    return os.path.join(os.path.dirname(volatility3.__file__), "schemas")
+
+
+def patch_schema():
+    """Let Volatility 3 accept btf2json profiles (kind: btf/symdb). Idempotent."""
+    import glob
+
+    old = '"^(dwarf|symtab|system-map)$"'
+    new = '"^(btf|symdb|dwarf|symtab|system-map)$"'
+    changed = []
+    for f in glob.glob(os.path.join(schemas_dir(), "schema-*.json")):
+        txt = open(f, encoding="utf-8").read()
+        if old in txt:
+            open(f, "w", encoding="utf-8").write(txt.replace(old, new))
+            changed.append(os.path.basename(f))
+    return changed
 
 
 # --------------------------------------------------------------------------- #
@@ -251,17 +314,33 @@ def cmd_find(args):
 
 
 def cmd_build(args):
-    if not args.elf and not args.system_map:
-        raise SystemExit("[volsyms] build needs --elf <vmlinux> and/or --system-map")
+    use_btf = bool(args.btf)
+    if not use_btf and not args.elf and not args.system_map:
+        raise SystemExit(
+            "[volsyms] build needs --elf <vmlinux-with-DWARF> (dwarf2json) "
+            "or --btf <vmlinux> --system-map <map> (btf2json, Arch-friendly)"
+        )
+    src = args.btf or args.elf or args.system_map
     if args.install and not args.out:
         symbols_dir = args.symbols_dir or default_symbols_dir()
         if not symbols_dir:
             raise SystemExit("[volsyms] cannot locate symbols dir; pass --symbols-dir/--out")
         os.makedirs(symbols_dir, exist_ok=True)
-        base = os.path.basename(args.elf or args.system_map)
-        args.out = os.path.join(symbols_dir, base + ".json.xz")
-    out = args.out or (os.path.basename(args.elf or args.system_map) + ".json.xz")
-    build_isf(args.elf, args.system_map, out, build_tool=args.build_tool)
+        args.out = os.path.join(symbols_dir, os.path.basename(src) + ".json.xz")
+    out = args.out or (os.path.basename(src) + ".json.xz")
+
+    if use_btf:
+        build_isf_btf(args.btf, args.system_map, out, build_tool=args.build_tool)
+        if args.patch_schema:
+            ch = patch_schema()
+            log(f"schema patched: {', '.join(ch) if ch else '(already allows btf)'}")
+        else:
+            log(
+                "NOTE: Volatility rejects btf2json profiles until its schema is patched. "
+                "Re-run with --patch-schema (one-off) or the ISF will not load."
+            )
+    else:
+        build_isf(args.elf, args.system_map, out, build_tool=args.build_tool)
     return 0
 
 
@@ -284,13 +363,27 @@ def main():
     pf.add_argument("--dry-run", action="store_true", help="show the URL, do not download")
     pf.set_defaults(func=cmd_find)
 
-    pbuild = sub.add_parser("build", help="build an ISF locally with dwarf2json")
-    pbuild.add_argument("--elf", help="vmlinux ELF containing DWARF debug info")
-    pbuild.add_argument("--system-map", help="System.map file")
+    pbuild = sub.add_parser("build", help="build an ISF locally (dwarf2json or btf2json)")
+    pbuild.add_argument("--elf", help="vmlinux ELF with DWARF debug info -> dwarf2json")
+    pbuild.add_argument(
+        "--btf",
+        help="vmlinux/BTF source -> btf2json (no DWARF needed; Arch-friendly). "
+        "Needs --system-map too.",
+    )
+    pbuild.add_argument("--system-map", help="System.map or /proc/kallsyms (symbol addresses)")
     pbuild.add_argument("--out", help="output path (.json or .json.xz)")
     pbuild.add_argument("--install", action="store_true", help="write into the symbols dir")
     pbuild.add_argument("--symbols-dir", help="override Volatility 3 symbols/linux dir")
-    pbuild.add_argument("--build-tool", action="store_true", help="go install dwarf2json if missing")
+    pbuild.add_argument(
+        "--build-tool",
+        action="store_true",
+        help="build the needed generator if missing (go install / cargo install)",
+    )
+    pbuild.add_argument(
+        "--patch-schema",
+        action="store_true",
+        help="patch Volatility's schema so btf2json profiles validate",
+    )
     pbuild.set_defaults(func=cmd_build)
 
     args = p.parse_args()

@@ -36,8 +36,11 @@ volsyms find -f memory.lime --dry-run
 # Look up a banner string directly (no dump needed)
 volsyms find --banner 'Linux version 5.4.0-42-generic ...'
 
-# Build an ISF from a debug kernel and install it (builds dwarf2json if needed)
+# Build an ISF from a DWARF kernel with dwarf2json (builds the tool if needed)
 volsyms build --elf ./vmlinux --system-map ./System.map --install --build-tool
+
+# Build an ISF from BTF with btf2json (no DWARF needed) and let it load
+volsyms build --btf ./vmlinux --system-map ./System.map --install --build-tool --patch-schema
 ```
 
 ### Handy alias
@@ -45,6 +48,54 @@ volsyms build --elf ./vmlinux --system-map ./System.map --install --build-tool
 ```sh
 alias volsyms='~/.venv/bin/python ~/vol3-tools/volsyms.py'
 ```
+
+## Building a profile from scratch (Arch Linux)
+
+When the online index has no match, build the ISF yourself. There are two
+generators; `volsyms build` drives either and can install the toolchain for you.
+
+| Generator | Needs | When to use |
+|---|---|---|
+| `dwarf2json` | a `vmlinux` **with DWARF** debug info | you compiled the kernel with `CONFIG_DEBUG_INFO=y`, or have a debug kernel |
+| `btf2json` | a kernel with **BTF** + a symbol map | the usual Arch case: the stock kernel ships BTF (`CONFIG_DEBUG_INFO_BTF=y`) but no DWARF |
+
+Install the toolchain (Arch):
+
+```sh
+sudo pacman -S --needed go rust dwarves   # go: dwarf2json, rust: btf2json, dwarves: pahole
+```
+
+### From a stock Arch kernel (BTF path)
+
+`/boot/vmlinuz-linux` is stripped (no DWARF) but carries BTF, so use `btf2json`:
+
+```sh
+# 1. extract the vmlinux (with its .BTF section) from the boot image
+/usr/src/linux/scripts/extract-vmlinux /boot/vmlinuz-linux > /tmp/vmlinux
+
+# 2. symbol addresses — kallsyms is a live System.map (root, else addresses are 0)
+sudo sh -c 'cat /proc/kallsyms > /tmp/System.map'
+
+# 3. build, install into the symbols dir, and patch the schema so it loads
+~/.venv/bin/python volsyms.py build \
+    --btf /tmp/vmlinux --system-map /tmp/System.map \
+    --install --build-tool --patch-schema
+```
+
+> `btf2json` profiles declare `kind: btf`, which Volatility's JSON schema rejects
+> until patched — `--patch-schema` does that one-off edit to your install.
+
+### From a kernel you compiled with debug info (DWARF path)
+
+```sh
+# vmlinux is in the kernel build tree root when CONFIG_DEBUG_INFO=y
+~/.venv/bin/python volsyms.py build \
+    --elf /path/to/linux/vmlinux --system-map /path/to/linux/System.map \
+    --install --build-tool
+```
+
+> Other distros: a DWARF `vmlinux` comes from that distro's debug-kernel package
+> (e.g. Fedora `kernel-debuginfo`). The commands above are for an Arch host.
 
 ## How `find` works
 
