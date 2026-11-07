@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # volsyms - automate Linux/macOS ISF kernel-symbol acquisition for Volatility 3.
 #
-# Two modes:
+# Subcommands:
+#   banner Carve and print the kernel banner(s) from a memory dump (Linux/Darwin).
 #   find   Carve the kernel banner from a memory dump, look it up in the
 #          Abyss-W4tcher/volatility3-symbols index, download the matching ISF
 #          and drop it into Volatility 3's symbols directory.
-#   build  Generate an ISF locally with dwarf2json from a vmlinux-with-DWARF
-#          (and/or a System.map), then install it.
+#   build  Generate an ISF locally with dwarf2json (DWARF) or btf2json (BTF)
+#          from a vmlinux and/or a System.map, then install it.
+#   search Grep the cached index for banners matching a substring.
 #
 # Stdlib only. The remote index used is the project's own stable mapping file:
 #   https://github.com/Abyss-W4tcher/volatility3-symbols -> banners/banners_plain.json
@@ -26,13 +28,17 @@ import time
 import urllib.parse
 import urllib.request
 
+__version__ = "1.1.0"
+
 BANNERS_PLAIN_URL = (
     "https://github.com/Abyss-W4tcher/volatility3-symbols/raw/master/banners/banners_plain.json"
 )
 CACHE_DIR = os.path.expanduser("~/.cache/volsyms")
 CACHE_FILE = os.path.join(CACHE_DIR, "banners_plain.json")
 CACHE_MAX_AGE = 7 * 24 * 3600  # refresh the index weekly
-BANNER_RE = re.compile(rb"Linux version \d+\.\d+[^\x00\n]{0,400}")
+BANNER_RE = re.compile(
+    rb"(?:Linux version|Darwin Kernel Version) \d+\.\d+[^\x00\n]{0,400}"
+)
 DWARF2JSON_REPO = "github.com/volatilityfoundation/dwarf2json@latest"
 BTF2JSON_REPO = "https://github.com/vobst/btf2json"
 
@@ -155,7 +161,20 @@ def install_isf(url, symbols_dir, dry_run=False):
     log(f"downloading {url}")
     tmp = dest + ".part"
     with urllib.request.urlopen(url, timeout=120) as r, open(tmp, "wb") as out:
-        shutil.copyfileobj(r, out)
+        total = int(r.headers.get("Content-Length") or 0)
+        show = sys.stderr.isatty() and total > 0
+        done = 0
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            if show:
+                pct = done * 100 // total
+                print(f"\r[volsyms] {pct:3d}%  {done}/{total} bytes", end="", file=sys.stderr)
+        if show:
+            print("", file=sys.stderr)
     os.replace(tmp, dest)
     log(f"installed {dest} ({os.path.getsize(dest)} bytes)")
     return dest
@@ -276,11 +295,22 @@ def patch_schema():
 def cmd_banner(args):
     banners = carve_banners(args.file)
     if not banners:
-        log("no Linux banner found (not a Linux dump, or kernel paged out)")
+        log("no Linux/Darwin banner found (not a Linux/macOS dump, or kernel paged out)")
         return 1
     for b in banners:
         print(b)
     return 0
+
+
+def cmd_search(args):
+    index = load_index(refresh=args.refresh)
+    q = args.query.lower()
+    hits = sorted(k for k in index if q in k.lower())
+    for k in hits[: args.limit]:
+        print(k)
+    extra = f" (showing first {args.limit})" if len(hits) > args.limit else ""
+    log(f"{len(hits)} match(es) of {len(index)} banners{extra}")
+    return 0 if hits else 2
 
 
 def cmd_find(args):
@@ -289,7 +319,7 @@ def cmd_find(args):
     else:
         banners = carve_banners(args.file)
         if not banners:
-            log("no Linux banner found in dump; nothing to look up")
+            log("no Linux/Darwin banner found in dump; nothing to look up")
             return 1
         log(f"carved {len(banners)} banner(s); using: {banners[0]}")
     index = load_index(refresh=args.refresh)
@@ -348,9 +378,10 @@ def main():
     p = argparse.ArgumentParser(
         description="Automate Volatility 3 Linux/macOS ISF kernel symbols."
     )
+    p.add_argument("--version", action="version", version=f"volsyms {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pb = sub.add_parser("banner", help="print Linux banner(s) carved from a dump")
+    pb = sub.add_parser("banner", help="print Linux/Darwin banner(s) carved from a dump")
     pb.add_argument("-f", "--file", required=True)
     pb.set_defaults(func=cmd_banner)
 
@@ -362,6 +393,12 @@ def main():
     pf.add_argument("--no-fuzzy", action="store_true", help="exact matches only")
     pf.add_argument("--dry-run", action="store_true", help="show the URL, do not download")
     pf.set_defaults(func=cmd_find)
+
+    ps = sub.add_parser("search", help="grep the cached index for banners matching a substring")
+    ps.add_argument("query", help="substring to look for (case-insensitive)")
+    ps.add_argument("--refresh", action="store_true", help="force re-download the index")
+    ps.add_argument("--limit", type=int, default=50, help="max results to print (default 50)")
+    ps.set_defaults(func=cmd_search)
 
     pbuild = sub.add_parser("build", help="build an ISF locally (dwarf2json or btf2json)")
     pbuild.add_argument("--elf", help="vmlinux ELF with DWARF debug info -> dwarf2json")

@@ -36,6 +36,12 @@ volsyms find -f memory.lime --dry-run
 # Look up a banner string directly (no dump needed)
 volsyms find --banner 'Linux version 5.4.0-42-generic ...'
 
+# Search the cached index for available banners (no dump needed)
+volsyms search '5.4.0-42-generic'
+
+# Print the version
+volsyms --version
+
 # Build an ISF from a DWARF kernel with dwarf2json (builds the tool if needed)
 volsyms build --elf ./vmlinux --system-map ./System.map --install --build-tool
 
@@ -99,12 +105,14 @@ sudo sh -c 'cat /proc/kallsyms > /tmp/System.map'
 
 ## How `find` works
 
-1. Carves every `Linux version …` string from the dump (memory-mapped, fast).
+1. Carves every `Linux version …` / `Darwin Kernel Version …` string from the
+   dump (memory-mapped, fast).
 2. Fetches and caches the project's stable `banners/banners_plain.json` index
    (`~/.cache/volsyms/`, refreshed weekly).
 3. Matches your banner (exact → whitespace-normalised → fuzzy ≥ 0.9).
-4. Downloads the matching `.json.xz` ISF into `…/volatility3/symbols/linux/`.
-   The filename is cosmetic — Volatility reads the banner inside the file.
+4. Downloads the matching `.json.xz` ISF into Volatility 3's symbols directory.
+   The filename and subdirectory are cosmetic — Volatility indexes ISFs by the
+   banner inside the file, so it resolves regardless of Linux/macOS subfolder.
 
 If no match exists, build one with `volsyms build`.
 
